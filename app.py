@@ -27,42 +27,45 @@ st.markdown(
     <style>
         h1 {color: #1e3a8a;}
         .disclaimer {
-            background: #fff7ed;
-            border-left: 5px solid #f97316;
-            padding: 12px;
-            border-radius: 8px;
-            color: #7c2d12;
-            font-size: 0.88rem;
+            background: #fff7ed; border-left: 5px solid #f97316;
+            padding: 12px; border-radius: 8px; color: #7c2d12; font-size: 0.88rem;
         }
         .footer {
-            margin-top: 40px;
-            padding: 14px;
-            background: #f1f5f9;
-            border-radius: 8px;
-            text-align: center;
-            color: #475569;
-            font-size: 0.85rem;
+            margin-top: 40px; padding: 14px; background: #f1f5f9;
+            border-radius: 8px; text-align: center; color: #475569; font-size: 0.85rem;
         }
         .restaurant-card {
-            border: 1px solid #e2e8f0;
-            border-radius: 10px;
-            padding: 16px 20px;
-            margin-bottom: 12px;
-            background: white;
+            border: 1px solid #e2e8f0; border-radius: 10px;
+            padding: 16px 20px; margin-bottom: 12px; background: white;
         }
         .restaurant-card.pass {border-left: 6px solid #22c55e;}
         .restaurant-card.fail {border-left: 6px solid #ef4444;}
         .restaurant-card.other {border-left: 6px solid #94a3b8;}
         .badge {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-weight: 700;
-            font-size: 0.85rem;
+            display: inline-block; padding: 4px 12px; border-radius: 20px;
+            font-weight: 700; font-size: 0.85rem;
         }
         .badge.pass {background: #dcfce7; color: #166534;}
         .badge.fail {background: #fee2e2; color: #991b1b;}
         .badge.other {background: #e2e8f0; color: #334155;}
+        .hbar-row {
+            display: flex; align-items: center; margin-bottom: 6px;
+            font-size: 0.85rem;
+        }
+        .hbar-label {
+            width: 40%; padding-right: 8px; color: #334155;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .hbar-track {
+            flex: 1; background: #e2e8f0; border-radius: 6px; height: 20px;
+            overflow: hidden; position: relative;
+        }
+        .hbar-fill {
+            height: 100%; background: #3b82f6; border-radius: 6px;
+        }
+        .hbar-value {
+            min-width: 60px; text-align: right; color: #475569; padding-left: 8px;
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -85,9 +88,8 @@ st.markdown(
 )
 
 
-# ---------- Data loading ----------
+# ---------- Helpers ----------
 def categorize_result(value):
-    """Map raw result values to Pass / Fail / Other."""
     if pd.isna(value):
         return "Other"
     v = str(value).lower()
@@ -98,6 +100,28 @@ def categorize_result(value):
     return "Other"
 
 
+def render_hbar_chart(series, color="#3b82f6"):
+    """Render a horizontal bar chart using pure HTML/CSS (no altair)."""
+    if series is None or len(series) == 0:
+        st.caption("No data to display.")
+        return
+    max_val = series.max() or 1
+    rows = []
+    for label, value in series.items():
+        pct = (value / max_val) * 100
+        rows.append(
+            f'<div class="hbar-row">'
+            f'<div class="hbar-label" title="{label}">{label}</div>'
+            f'<div class="hbar-track">'
+            f'<div class="hbar-fill" style="width:{pct:.1f}%; background:{color};"></div>'
+            f'</div>'
+            f'<div class="hbar-value">{value:,}</div>'
+            f'</div>'
+        )
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+
+# ---------- Data loading ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_all_data():
     all_records = []
@@ -119,7 +143,6 @@ def load_all_data():
 
     df = pd.DataFrame(all_records)
 
-    # Pre-compute a lowercase "search blob" combining all searchable fields
     parts = []
     for col in SEARCH_FIELDS:
         if col in df.columns:
@@ -142,26 +165,22 @@ with st.spinner("Loading all records from Boston Open Data (first run ~15–25 s
         st.error(f"Error contacting the API: {e}")
         st.stop()
 
-# Parse dates
 if "resultdttm" in df.columns:
     df["resultdttm"] = pd.to_datetime(
         df["resultdttm"], errors="coerce", utc=True
     ).dt.tz_localize(None)
 
-# Simplified result category
 if "result" in df.columns:
     df["result_category"] = df["result"].apply(categorize_result)
 else:
     df["result_category"] = "Other"
 
-# Date bounds
 if "resultdttm" in df.columns and df["resultdttm"].notna().any():
     min_date = df["resultdttm"].min().date()
     max_date = df["resultdttm"].max().date()
 else:
     min_date, max_date = date(2000, 1, 1), date.today()
 
-# Unique neighborhoods
 cities = sorted(df["city"].dropna().unique()) if "city" in df else []
 
 
@@ -175,49 +194,32 @@ with st.sidebar:
                 del st.session_state[k]
         st.rerun()
 
-    # --- Restaurant search ---
     name_q = st.text_input(
         "Restaurant name or keyword",
         placeholder="e.g. pizza hut, dunkin, mcdonald",
         key="filter_name",
-        help=(
-            "Searches across restaurant name, DBA name, owner, address, "
-            "neighborhood and ZIP. All words must match somewhere."
-        ),
+        help="Searches across name, DBA, owner, address, neighborhood and ZIP.",
     )
 
-    # --- Neighborhood ---
     sel_cities = st.multiselect(
-        "Neighborhood",
-        cities,
-        default=[],
-        key="filter_cities",
+        "Neighborhood", cities, default=[], key="filter_cities",
         placeholder="All neighborhoods",
     )
 
-    # --- Result category (only Pass / Fail) ---
     st.markdown("**Inspection result**")
     sel_categories = st.multiselect(
-        "Category",
-        ["Pass", "Fail"],
-        default=[],
-        key="filter_categories",
-        placeholder="All results",
-        label_visibility="collapsed",
+        "Category", ["Pass", "Fail"], default=[], key="filter_categories",
+        placeholder="All results", label_visibility="collapsed",
     )
 
-    # --- Date range with presets ---
     st.markdown("**Inspection date range**")
     preset = st.radio(
         "Period",
         ["All time", "Last week", "Last 15 days", "Last 30 days", "Last year", "Custom"],
-        index=0,
-        key="filter_date_preset",
-        label_visibility="collapsed",
+        index=0, key="filter_date_preset", label_visibility="collapsed",
     )
 
     date_from = date_to = None
-
     if preset == "All time":
         date_from, date_to = min_date, max_date
     elif preset == "Last week":
@@ -228,16 +230,14 @@ with st.sidebar:
         date_from, date_to = max_date - timedelta(days=30), max_date
     elif preset == "Last year":
         date_from, date_to = max_date - timedelta(days=365), max_date
-    else:  # Custom
+    else:
         c1, c2 = st.columns(2)
         with c1:
-            date_from = st.date_input(
-                "From", value=min_date, min_value=min_date, max_value=max_date
-            )
+            date_from = st.date_input("From", value=min_date,
+                                       min_value=min_date, max_value=max_date)
         with c2:
-            date_to = st.date_input(
-                "To", value=max_date, min_value=min_date, max_value=max_date
-            )
+            date_to = st.date_input("To", value=max_date,
+                                     min_value=min_date, max_value=max_date)
 
     st.caption(f"Data spans {min_date} → {max_date}")
 
@@ -245,7 +245,6 @@ with st.sidebar:
 # ---------- Filtering ----------
 filtered_df = df.copy()
 
-# Search: match ALL words across the pre-computed blob
 if name_q.strip() and "_search_blob" in filtered_df.columns:
     tokens = [t for t in name_q.strip().lower().split() if t]
     mask = pd.Series(True, index=filtered_df.index)
@@ -281,30 +280,23 @@ c4.metric("Fail count", f"{fail_n:,}")
 st.divider()
 
 if len(filtered_df) == 0:
-    st.warning(
-        "⚠️ No records match the current filters. Try broadening your search."
-    )
+    st.warning("⚠️ No records match the current filters. Try broadening your search.")
     st.stop()
 
 
 # ---------- Results ----------
 search_active = bool(name_q.strip())
 display_cols = [
-    c
-    for c in [
+    c for c in [
         "businessname", "address", "city", "zip",
         "result", "resultdttm", "viol_level", "violdesc", "comments",
-    ]
-    if c in filtered_df.columns
+    ] if c in filtered_df.columns
 ]
 
 if search_active:
-    # ============ SUMMARY CARDS ============
     st.subheader(f"🏪 Restaurant summary — {len(filtered_df):,} inspections found")
 
-    sorted_df = filtered_df.sort_values(
-        "resultdttm", ascending=False, na_position="last"
-    )
+    sorted_df = filtered_df.sort_values("resultdttm", ascending=False, na_position="last")
 
     grouped = (
         sorted_df.groupby(["businessname", "address"], dropna=False)
@@ -317,9 +309,7 @@ if search_active:
         )
         .reset_index()
     )
-    grouped["pass_rate"] = (
-        grouped["passes"] / grouped["inspections"] * 100
-    ).round(0).astype(int)
+    grouped["pass_rate"] = (grouped["passes"] / grouped["inspections"] * 100).round(0).astype(int)
     grouped = grouped.sort_values("latest_date", ascending=False)
 
     MAX_CARDS = 50
@@ -333,11 +323,7 @@ if search_active:
         else:
             card_cls, badge_cls, badge_txt = "other", "other", str(row["latest_result"]).upper()
 
-        date_str = (
-            row["latest_date"].strftime("%b %d, %Y")
-            if pd.notna(row["latest_date"])
-            else "N/A"
-        )
+        date_str = row["latest_date"].strftime("%b %d, %Y") if pd.notna(row["latest_date"]) else "N/A"
 
         st.markdown(
             f"""
@@ -370,10 +356,7 @@ if search_active:
         )
 
     if len(grouped) > MAX_CARDS:
-        st.caption(
-            f"Showing {MAX_CARDS} of {len(grouped):,} restaurants. "
-            f"Refine your search to see more."
-        )
+        st.caption(f"Showing {MAX_CARDS} of {len(grouped):,} restaurants. Refine your search to see more.")
 
     with st.expander("📋 Show detailed records table", expanded=False):
         view = filtered_df[display_cols].copy()
@@ -389,7 +372,6 @@ if search_active:
     )
 
 else:
-    # ============ DEFAULT TABLE VIEW ============
     left, right = st.columns([2, 1])
 
     with left:
@@ -427,13 +409,13 @@ else:
             )
             cat_counts = cat_counts[cat_counts > 0]
             if len(cat_counts) > 0:
-                st.bar_chart(cat_counts, height=220)
+                render_hbar_chart(cat_counts, color="#3b82f6")
 
         if "city" in filtered_df.columns:
             st.markdown("**Top 10 neighborhoods**")
             top_cities = filtered_df["city"].dropna().value_counts().head(10)
             if len(top_cities) > 0:
-                st.bar_chart(top_cities, height=280)
+                render_hbar_chart(top_cities, color="#8b5cf6")
 
 
 # ---------- Footer ----------
