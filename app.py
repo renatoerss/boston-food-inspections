@@ -18,6 +18,7 @@ HEADERS = {
     )
 }
 PAGE_SIZE = 32000
+SEARCH_FIELDS = ["businessname", "dbaname", "legalowner", "address", "city", "zip"]
 
 
 # ---------- Styling ----------
@@ -42,6 +43,26 @@ st.markdown(
             color: #475569;
             font-size: 0.85rem;
         }
+        .restaurant-card {
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin-bottom: 12px;
+            background: white;
+        }
+        .restaurant-card.pass {border-left: 6px solid #22c55e;}
+        .restaurant-card.fail {border-left: 6px solid #ef4444;}
+        .restaurant-card.other {border-left: 6px solid #94a3b8;}
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: 700;
+            font-size: 0.85rem;
+        }
+        .badge.pass {background: #dcfce7; color: #166534;}
+        .badge.fail {background: #fee2e2; color: #991b1b;}
+        .badge.other {background: #e2e8f0; color: #334155;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -65,6 +86,18 @@ st.markdown(
 
 
 # ---------- Data loading ----------
+def categorize_result(value):
+    """Map raw result values to Pass / Fail / Other."""
+    if pd.isna(value):
+        return "Other"
+    v = str(value).lower()
+    if "pass" in v:
+        return "Pass"
+    if "fail" in v:
+        return "Fail"
+    return "Other"
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_all_data():
     all_records = []
@@ -83,19 +116,23 @@ def load_all_data():
         if len(records) < PAGE_SIZE or len(all_records) >= total:
             break
         offset += PAGE_SIZE
-    return pd.DataFrame(all_records), total
 
+    df = pd.DataFrame(all_records)
 
-def categorize_result(value):
-    """Map raw result values to Pass / Fail / Other."""
-    if pd.isna(value):
-        return "Unknown"
-    v = str(value).lower()
-    if "pass" in v:
-        return "Pass"
-    if "fail" in v:
-        return "Fail"
-    return "Other"
+    # Pre-compute a lowercase "search blob" combining all searchable fields
+    parts = []
+    for col in SEARCH_FIELDS:
+        if col in df.columns:
+            parts.append(df[col].fillna("").astype(str))
+    if parts:
+        blob = parts[0]
+        for p in parts[1:]:
+            blob = blob + " | " + p
+        df["_search_blob"] = blob.str.lower()
+    else:
+        df["_search_blob"] = ""
+
+    return df, total
 
 
 with st.spinner("Loading all records from Boston Open Data (first run ~15–25 s)..."):
@@ -115,7 +152,7 @@ if "resultdttm" in df.columns:
 if "result" in df.columns:
     df["result_category"] = df["result"].apply(categorize_result)
 else:
-    df["result_category"] = "Unknown"
+    df["result_category"] = "Other"
 
 # Date bounds
 if "resultdttm" in df.columns and df["resultdttm"].notna().any():
@@ -140,10 +177,13 @@ with st.sidebar:
 
     # --- Restaurant search ---
     name_q = st.text_input(
-        "Restaurant name contains",
-        placeholder="e.g. pizza hut, dunkin",
+        "Restaurant name or keyword",
+        placeholder="e.g. pizza hut, dunkin, mcdonald",
         key="filter_name",
-        help="Searches for all words. 'pizza hut' finds 'Pizza Hut #1234'.",
+        help=(
+            "Searches across restaurant name, DBA name, owner, address, "
+            "neighborhood and ZIP. All words must match somewhere."
+        ),
     )
 
     # --- Neighborhood ---
@@ -155,37 +195,22 @@ with st.sidebar:
         placeholder="All neighborhoods",
     )
 
-    # --- Result category ---
+    # --- Result category (only Pass / Fail) ---
     st.markdown("**Inspection result**")
     sel_categories = st.multiselect(
         "Category",
-        ["Pass", "Fail", "Other"],
+        ["Pass", "Fail"],
         default=[],
         key="filter_categories",
         placeholder="All results",
         label_visibility="collapsed",
     )
 
-    show_exact = st.checkbox(
-        "Show exact result values",
-        value=False,
-        key="filter_exact_toggle",
-    )
-    sel_exact = []
-    if show_exact and "result" in df.columns:
-        exact_values = sorted(df["result"].dropna().unique())
-        sel_exact = st.multiselect(
-            "Exact value",
-            exact_values,
-            default=[],
-            key="filter_exact_values",
-        )
-
     # --- Date range with presets ---
     st.markdown("**Inspection date range**")
     preset = st.radio(
         "Period",
-        ["All time", "Last 30 days", "Last 6 months", "Last year", "Custom"],
+        ["All time", "Last week", "Last 15 days", "Last 30 days", "Last year", "Custom"],
         index=0,
         key="filter_date_preset",
         label_visibility="collapsed",
@@ -195,10 +220,12 @@ with st.sidebar:
 
     if preset == "All time":
         date_from, date_to = min_date, max_date
+    elif preset == "Last week":
+        date_from, date_to = max_date - timedelta(days=7), max_date
+    elif preset == "Last 15 days":
+        date_from, date_to = max_date - timedelta(days=15), max_date
     elif preset == "Last 30 days":
         date_from, date_to = max_date - timedelta(days=30), max_date
-    elif preset == "Last 6 months":
-        date_from, date_to = max_date - timedelta(days=180), max_date
     elif preset == "Last year":
         date_from, date_to = max_date - timedelta(days=365), max_date
     else:  # Custom
@@ -218,25 +245,19 @@ with st.sidebar:
 # ---------- Filtering ----------
 filtered_df = df.copy()
 
-# Search: match ALL words (case-insensitive, regex-safe)
-if name_q.strip() and "businessname" in filtered_df.columns:
+# Search: match ALL words across the pre-computed blob
+if name_q.strip() and "_search_blob" in filtered_df.columns:
     tokens = [t for t in name_q.strip().lower().split() if t]
+    mask = pd.Series(True, index=filtered_df.index)
     for token in tokens:
-        filtered_df = filtered_df[
-            filtered_df["businessname"]
-            .astype(str)
-            .str.lower()
-            .str.contains(token, regex=False, na=False)
-        ]
+        mask &= filtered_df["_search_blob"].str.contains(token, regex=False, na=False)
+    filtered_df = filtered_df[mask]
 
 if sel_cities and "city" in filtered_df.columns:
     filtered_df = filtered_df[filtered_df["city"].isin(sel_cities)]
 
 if sel_categories and "result_category" in filtered_df.columns:
     filtered_df = filtered_df[filtered_df["result_category"].isin(sel_categories)]
-
-if sel_exact and "result" in filtered_df.columns:
-    filtered_df = filtered_df[filtered_df["result"].isin(sel_exact)]
 
 if date_from and "resultdttm" in filtered_df.columns:
     filtered_df = filtered_df[filtered_df["resultdttm"] >= pd.Timestamp(date_from)]
@@ -260,71 +281,159 @@ c4.metric("Fail count", f"{fail_n:,}")
 st.divider()
 
 if len(filtered_df) == 0:
-    st.warning("⚠️ No records match the current filters. Try broadening your search.")
+    st.warning(
+        "⚠️ No records match the current filters. Try broadening your search."
+    )
     st.stop()
 
 
 # ---------- Results ----------
-left, right = st.columns([2, 1])
-
-with left:
-    st.subheader("📋 Inspection results")
-    display_cols = [
-        c
-        for c in [
-            "businessname",
-            "address",
-            "city",
-            "zip",
-            "result",
-            "resultdttm",
-            "viol_level",
-            "violdesc",
-            "comments",
-        ]
-        if c in filtered_df.columns
+search_active = bool(name_q.strip())
+display_cols = [
+    c
+    for c in [
+        "businessname", "address", "city", "zip",
+        "result", "resultdttm", "viol_level", "violdesc", "comments",
     ]
+    if c in filtered_df.columns
+]
 
-    view = filtered_df[display_cols].copy()
-    if "resultdttm" in view.columns:
-        view = view.sort_values("resultdttm", ascending=False)
+if search_active:
+    # ============ SUMMARY CARDS ============
+    st.subheader(f"🏪 Restaurant summary — {len(filtered_df):,} inspections found")
 
-    MAX_ROWS = 5000
-    if len(view) > MAX_ROWS:
-        st.caption(
-            f"Showing first {MAX_ROWS:,} of {len(view):,} rows "
-            f"(use filters to narrow down). Full set available in the CSV export."
+    sorted_df = filtered_df.sort_values(
+        "resultdttm", ascending=False, na_position="last"
+    )
+
+    grouped = (
+        sorted_df.groupby(["businessname", "address"], dropna=False)
+        .agg(
+            inspections=("result_category", "count"),
+            passes=("result_category", lambda x: (x == "Pass").sum()),
+            fails=("result_category", lambda x: (x == "Fail").sum()),
+            latest_date=("resultdttm", "max"),
+            latest_result=("result_category", "first"),
         )
-        view = view.head(MAX_ROWS)
+        .reset_index()
+    )
+    grouped["pass_rate"] = (
+        grouped["passes"] / grouped["inspections"] * 100
+    ).round(0).astype(int)
+    grouped = grouped.sort_values("latest_date", ascending=False)
 
-    st.dataframe(view, use_container_width=True, height=520)
+    MAX_CARDS = 50
+    shown = grouped.head(MAX_CARDS)
+
+    for _, row in shown.iterrows():
+        if row["latest_result"] == "Pass":
+            card_cls, badge_cls, badge_txt = "pass", "pass", "PASS"
+        elif row["latest_result"] == "Fail":
+            card_cls, badge_cls, badge_txt = "fail", "fail", "FAIL"
+        else:
+            card_cls, badge_cls, badge_txt = "other", "other", str(row["latest_result"]).upper()
+
+        date_str = (
+            row["latest_date"].strftime("%b %d, %Y")
+            if pd.notna(row["latest_date"])
+            else "N/A"
+        )
+
+        st.markdown(
+            f"""
+            <div class="restaurant-card {card_cls}">
+                <div style="display:flex; justify-content:space-between; align-items:start;">
+                    <div>
+                        <div style="font-size:1.1rem; font-weight:700; color:#0f172a;">
+                            {row['businessname']}
+                        </div>
+                        <div style="color:#64748b; font-size:0.88rem; margin-top:2px;">
+                            📍 {row['address']}
+                        </div>
+                    </div>
+                    <div style="text-align:right;">
+                        <span class="badge {badge_cls}">{badge_txt}</span>
+                        <div style="color:#64748b; font-size:0.78rem; margin-top:6px;">
+                            Latest: {date_str}
+                        </div>
+                    </div>
+                </div>
+                <div style="display:flex; gap:30px; margin-top:14px; font-size:0.9rem;">
+                    <div><b>{row['inspections']}</b> <span style="color:#64748b;">inspections</span></div>
+                    <div><b style="color:#166534;">{row['passes']}</b> <span style="color:#64748b;">passes</span></div>
+                    <div><b style="color:#991b1b;">{row['fails']}</b> <span style="color:#64748b;">fails</span></div>
+                    <div><b>{row['pass_rate']}%</b> <span style="color:#64748b;">pass rate</span></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if len(grouped) > MAX_CARDS:
+        st.caption(
+            f"Showing {MAX_CARDS} of {len(grouped):,} restaurants. "
+            f"Refine your search to see more."
+        )
+
+    with st.expander("📋 Show detailed records table", expanded=False):
+        view = filtered_df[display_cols].copy()
+        if "resultdttm" in view.columns:
+            view = view.sort_values("resultdttm", ascending=False)
+        st.dataframe(view, use_container_width=True, height=420)
 
     st.download_button(
-        "📥 Download full filtered results (CSV)",
+        "📥 Download all matching records (CSV)",
         data=filtered_df[display_cols].to_csv(index=False).encode("utf-8"),
         file_name="boston_inspections.csv",
         mime="text/csv",
     )
 
-with right:
-    st.subheader("📊 Summary")
+else:
+    # ============ DEFAULT TABLE VIEW ============
+    left, right = st.columns([2, 1])
 
-    if "result_category" in filtered_df.columns:
-        st.markdown("**By category**")
-        cat_counts = (
-            filtered_df["result_category"]
-            .value_counts()
-            .reindex(["Pass", "Fail", "Other"], fill_value=0)
+    with left:
+        st.subheader("📋 Inspection results")
+        view = filtered_df[display_cols].copy()
+        if "resultdttm" in view.columns:
+            view = view.sort_values("resultdttm", ascending=False)
+
+        MAX_ROWS = 5000
+        if len(view) > MAX_ROWS:
+            st.caption(
+                f"Showing first {MAX_ROWS:,} of {len(view):,} rows. "
+                f"Use filters to narrow down — full set available in the CSV export."
+            )
+            view = view.head(MAX_ROWS)
+
+        st.dataframe(view, use_container_width=True, height=520)
+
+        st.download_button(
+            "📥 Download full filtered results (CSV)",
+            data=filtered_df[display_cols].to_csv(index=False).encode("utf-8"),
+            file_name="boston_inspections.csv",
+            mime="text/csv",
         )
-        cat_counts = cat_counts[cat_counts > 0]
-        if len(cat_counts) > 0:
-            st.bar_chart(cat_counts, height=220)
 
-    if "city" in filtered_df.columns:
-        st.markdown("**Top 10 neighborhoods**")
-        top_cities = filtered_df["city"].dropna().value_counts().head(10)
-        if len(top_cities) > 0:
-            st.bar_chart(top_cities, height=280)
+    with right:
+        st.subheader("📊 Summary")
+
+        if "result_category" in filtered_df.columns:
+            st.markdown("**By category**")
+            cat_counts = (
+                filtered_df["result_category"]
+                .value_counts()
+                .reindex(["Pass", "Fail", "Other"], fill_value=0)
+            )
+            cat_counts = cat_counts[cat_counts > 0]
+            if len(cat_counts) > 0:
+                st.bar_chart(cat_counts, height=220)
+
+        if "city" in filtered_df.columns:
+            st.markdown("**Top 10 neighborhoods**")
+            top_cities = filtered_df["city"].dropna().value_counts().head(10)
+            if len(top_cities) > 0:
+                st.bar_chart(top_cities, height=280)
 
 
 # ---------- Footer ----------
